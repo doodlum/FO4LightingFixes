@@ -96,21 +96,64 @@ namespace
 
 namespace Hook
 {
-	// An empty ng/ae falls back to og, so one pattern can serve every family.
+	Runtime GetRuntime()
+	{
+		// VR is answered before CommonLibF4 is asked: its table does not know
+		// 1.2.72 and REX::FModule::GetRuntimeIndex() terminates on an unknown
+		// version.  Nothing in this plugin may call that on VR.
+		static const auto runtime = []() {
+			const auto version = REX::FModule::GetExecutingModule().GetFileVersion();
+			if (version == REL::Version{ 1, 2, 72, 0 }) {
+				return Runtime::kVR;
+			}
+			switch (REX::FModule::GetRuntimeIndex()) {
+			case REX::FModule::Runtime::kNG:
+				return Runtime::kNG;
+			case REX::FModule::Runtime::kAE:
+				return Runtime::kAE;
+			default:
+				return Runtime::kOG;
+			}
+		}();
+		return runtime;
+	}
+
+	bool IsVR()
+	{
+		return GetRuntime() == Runtime::kVR;
+	}
+
+	// An empty ng/ae/vr falls back to og, so one pattern can serve every family.
 	std::string_view Pattern::Get() const
 	{
-		switch (REX::FModule::GetRuntimeIndex()) {
-		case REX::FModule::Runtime::kNG:
+		switch (GetRuntime()) {
+		case Runtime::kNG:
 			return ng.empty() ? og : ng;
-		case REX::FModule::Runtime::kAE:
+		case Runtime::kAE:
 			return ae.empty() ? og : ae;
+		case Runtime::kVR:
+			return vr.empty() ? og : vr;
 		default:
 			return og;
 		}
 	}
 
+	std::uintptr_t Target::Address() const
+	{
+		if (IsVR()) {
+			// The verify step refuses a zero: the image base starts with "MZ".
+			return vr ? REX::FModule::GetExecutingModule().GetBaseAddress() + vr : 0;
+		}
+		return flat.address();
+	}
+
 	bool Verify(std::uintptr_t a_target, const Pattern& a_pattern, const char* a_what)
 	{
+		if (a_target == 0) {
+			REX::ERROR("{}: not mapped on this runtime; nothing to hook", a_what);
+			return false;
+		}
+
 		const auto pattern = a_pattern.Get();
 		const auto parsed = Parse(pattern);
 		if (parsed.size == 0) {

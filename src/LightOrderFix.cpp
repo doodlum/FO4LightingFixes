@@ -20,30 +20,40 @@ namespace
 	// NG and AE share one id space, so the AE id serves both.  None of these ids
 	// exist in the 1.10.163 database, which is a different id space; each function
 	// was located in that binary separately.
-	//                                  1.10.163  1.10.980/984  1.11.137-240
-	const REL::VariantID kRemove{ 981017u, 2319061u, 2319061u };
-	const REL::VariantID kTeardownDriver{ 222957u, 2317472u, 2317472u };
-	const REL::VariantID kApply{ 1210164u, 2318420u, 2318420u };
-	const REL::VariantID kPreCullingActive{ 917969u, 2317322u, 2317322u };
+	//
+	// VR (1.2.72) is a fixed image offset, read out of the VR binary.  The PDB
+	// names it carries are given for each; the VR address library, whose ids are
+	// the 1.10.163 ones where a function matches, agrees on every entry it has
+	// (`remove` 981017, driver 222957, pre-culling query 917969) and lacks the
+	// other two.
+	//                                 1.10.163  1.10.980/984  1.11.137-240    1.2.72
+	const Hook::Target kRemove{ REL::VariantID{ 981017u, 2319061u, 2319061u }, 0x28F1FB0 };           // BSShaderPropertyLightData::RemoveLight
+	const Hook::Target kTeardownDriver{ REL::VariantID{ 222957u, 2317472u, 2317472u }, 0x27EB2C0 };   // ShadowSceneNode::UpdateQueuedLight
+	const Hook::Target kApply{ REL::VariantID{ 1210164u, 2318420u, 2318420u }, 0x286E470 };           // BSLight::AddFadeNodeLocked
+	const Hook::Target kPreCullingActive{ REL::VariantID{ 917969u, 2317322u, 2317322u }, 0x27E0D50 };  // BSPreCulledObjects::QEnabled
 
 	// `remove` and the teardown driver were recompiled between 1.10.163 and
 	// 1.11.240, so their expected bytes are per-runtime as well as their ids.  OG
 	// and NG get five bytes rather than sixteen: neither binary is on hand, and a
-	// longer pattern would refuse on any recompile.
+	// longer pattern would refuse on any recompile.  VR's `remove` keeps only the
+	// fence test and the stamp; the array search is split into a helper it calls.
 	const Hook::Pattern kRemovePattern{
 		.og = "48 89 54 24 10",
 		.ng = "48 89 5C 24 10",
 		.ae = "48 89 5C 24 10 56 48 83 EC 30 BE FF FF FF FF 4C",
+		.vr = "48 89 54 24 10 53 48 83 EC 20 83 39 FF 48 8B D9",
 	};
 	const Hook::Pattern kTeardownPattern{
 		.og = "48 89 74 24 20",
 		.ng = "48 89 54 24 10",
 		.ae = "48 89 54 24 10 56 57 41 54 41 57 48 83 EC 38 44",
+		.vr = "48 89 74 24 20 57 41 54 41 57 48 83 EC 30 44 8B",
 	};
 
 	// Located in 1.10.163 by masked signature against the 1.11.240 bytes, so their
-	// prologues agree across all three families.  The pre-culling query opens with
-	// two `cmp byte ptr [rip+disp32], 0`; the displacements are wildcarded.
+	// prologues agree across all three families, and VR's are byte-identical.  The
+	// pre-culling query opens with two `cmp byte ptr [rip+disp32], 0`; the
+	// displacements are wildcarded.
 	const Hook::Pattern kApplyPattern{
 		.og = "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48",
 	};
@@ -51,10 +61,16 @@ namespace
 		.og = "80 3D ?? ?? ?? ?? 00 74 15 80 3D ?? ?? ?? ?? 00",
 	};
 
-	constexpr std::ptrdiff_t kLightData = 0x140;  // node -> list
-	constexpr std::ptrdiff_t kArray = 0x10;       // list -> BSLight**
-	constexpr std::ptrdiff_t kCount = 0x20;       // list -> count
-	constexpr std::ptrdiff_t kRefCount = 0x08;    // NiRefObject::refCount
+	// node -> list.  VR's NiAVObject carries 0x40 more bytes ahead of the
+	// BSFadeNode members, so its list sits further in; the list itself (fence,
+	// stamp, BSTArray) is laid out the same.
+	constexpr std::ptrdiff_t kLightDataFlat = 0x140;
+	constexpr std::ptrdiff_t kLightDataVR = 0x180;
+	constexpr std::ptrdiff_t kArray = 0x10;     // list -> BSLight**
+	constexpr std::ptrdiff_t kCount = 0x20;     // list -> count
+	constexpr std::ptrdiff_t kRefCount = 0x08;  // NiRefObject::refCount
+
+	std::ptrdiff_t g_lightData = kLightDataFlat;  // set in Install
 
 	constexpr std::size_t kMaxLights = 32;
 	constexpr std::size_t kMaxPending = 512;
@@ -151,7 +167,7 @@ namespace
 			return nullptr;
 		}
 
-		auto* node = static_cast<std::uint8_t*>(const_cast<void*>(a_list)) - kLightData;
+		auto* node = static_cast<std::uint8_t*>(const_cast<void*>(a_list)) - g_lightData;
 
 		std::uint32_t count{};
 		void**        array{};
@@ -328,11 +344,13 @@ namespace LightOrderFix
 {
 	bool Install()
 	{
+		g_lightData = Hook::IsVR() ? kLightDataVR : kLightDataFlat;
+
 		// Verified before anything is patched.  These two are only ever called, so
 		// the byte check is all that stands between a stale mapping and a call into
 		// an arbitrary function with (light, node).
-		const auto applyAddress = kApply.address();
-		const auto preCullingAddress = kPreCullingActive.address();
+		const auto applyAddress = kApply.Address();
+		const auto preCullingAddress = kPreCullingActive.Address();
 		const bool applyOk = Hook::Verify(applyAddress, kApplyPattern,
 			"light order fix (apply)");
 		const bool preCullingOk = Hook::Verify(preCullingAddress, kPreCullingPattern,
@@ -345,10 +363,10 @@ namespace LightOrderFix
 
 		// Deliberately not short-circuited: on an unmapped runtime every failure is
 		// worth seeing at once, not just the first.
-		const bool remove = Hook::Create(g_remove, kRemove.address(),
+		const bool remove = Hook::Create(g_remove, kRemove.Address(),
 			reinterpret_cast<void*>(&Remove), kRemovePattern,
 			"light order fix (remove)");
-		const bool teardown = Hook::Create(g_teardown, kTeardownDriver.address(),
+		const bool teardown = Hook::Create(g_teardown, kTeardownDriver.Address(),
 			reinterpret_cast<void*>(&Teardown), kTeardownPattern,
 			"light order fix (teardown)");
 		if (!remove || !teardown) {
