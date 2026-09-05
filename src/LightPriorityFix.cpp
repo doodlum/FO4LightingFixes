@@ -10,6 +10,7 @@
 #include "LightPriorityFix.h"
 
 #include "Hook.h"
+#include "RE/BSLight.h"
 
 #include <algorithm>
 #include <cmath>
@@ -30,21 +31,15 @@ namespace
 		.og = "48 89 5C 24 08 80 7C 24 28 00 45 8B D8 48 8B DA",
 	};
 
-	constexpr std::ptrdiff_t kArray = 0x10;        // list -> BSLight**
-	constexpr std::ptrdiff_t kCount = 0x20;        // list -> count
-	constexpr std::ptrdiff_t kBounds = 0xB0;       // node -> cx, cy, cz, radius
-	constexpr std::ptrdiff_t kInner = 0xB8;        // light -> data block
-	constexpr std::ptrdiff_t kInnerPos = 0xA0;     // data -> world position
-	constexpr std::ptrdiff_t kInnerFlags = 0x108;  // data -> bit 0 = app-culled
-
-	// What moved in VR.  Its NiAVObject is 0x40 larger, which pushes the node's
-	// list along; its NiLight carries the radius 0x40 further in; and the two sun
-	// slots the gather copies from its context sit 0x40 later as well.  The bounds
-	// stay put: they are inside the part of NiAVObject that did not grow.
+	// What moved in VR.  NiAVObject is 0x40 larger, which pushes the node's
+	// list along; NiLight carries the radius 0x40 further in; and the two sun
+	// slots the gather copies from its context sit 0x40 later as well.  The
+	// world position, bounds and flags sit inside the part of NiAVObject that
+	// did not grow.
 	struct Layout
 	{
 		std::ptrdiff_t lightData;    // node -> list
-		std::ptrdiff_t innerRadius;  // data -> radius
+		std::ptrdiff_t innerRadius;  // NiLight -> radius
 		std::ptrdiff_t sun;          // ctx -> sun, a_alt == false
 		std::ptrdiff_t sunAlt;       // ctx -> sun, a_alt == true
 	};
@@ -75,32 +70,31 @@ namespace
 
 	struct Ranked
 	{
-		void*         light;
+		RE::BSLight*  light;
 		float         weight;
 		std::uint32_t index;
 	};
 
 	// REL::ID(2318430), recomputed: the weight the engine stored lives in the
 	// attach's temporary buffer, which is freed before the gather runs.
-	bool Weigh(void* a_light, const float* a_bounds, float* a_out) noexcept
+	bool Weigh(RE::BSLight* a_light, const RE::NiBound& a_bounds, float* a_out) noexcept
 	{
-		const void* inner{};
-		if (!Read(static_cast<const std::uint8_t*>(a_light) + kInner, &inner) || !inner) {
+		auto* niLight = a_light->light;
+		if (!niLight) {
 			return false;
 		}
-		const auto* ib = static_cast<const std::uint8_t*>(inner);
-		float       pos[3]{};
-		float       radius{};
-		if (!Read(ib + kInnerPos, &pos) || !Read(ib + g_layout.innerRadius, &radius)) {
+		float radius{};
+		if (!Read(reinterpret_cast<const std::uint8_t*>(niLight) + g_layout.innerRadius, &radius)) {
 			return false;
 		}
-		const auto dx = pos[0] - a_bounds[0];
-		const auto dy = pos[1] - a_bounds[1];
-		const auto dz = pos[2] - a_bounds[2];
-		const auto distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+		const auto& pos = niLight->world.translate;
+		const auto  dx = pos.x - a_bounds.center.x;
+		const auto  dy = pos.y - a_bounds.center.y;
+		const auto  dz = pos.z - a_bounds.center.z;
+		const auto  distance = std::sqrt(dx * dx + dy * dy + dz * dz);
 		// The engine divides by this unguarded; rank a degenerate light last
 		// instead of producing a NaN that would poison the comparison.
-		const auto weight = radius > 0.0f ? (distance - a_bounds[3]) / radius : kRankLast;
+		const auto weight = radius > 0.0f ? (distance - a_bounds.fRadius) / radius : kRankLast;
 		if (std::isnan(weight)) {
 			return false;
 		}
@@ -108,18 +102,13 @@ namespace
 		return true;
 	}
 
-	bool Culled(void* a_light, bool* a_out) noexcept
+	bool Culled(RE::BSLight* a_light) noexcept
 	{
-		const void* inner{};
-		if (!Read(static_cast<const std::uint8_t*>(a_light) + kInner, &inner) || !inner) {
+		auto* niLight = a_light->light;
+		if (!niLight) {
 			return false;
 		}
-		std::uint8_t flags{};
-		if (!Read(static_cast<const std::uint8_t*>(inner) + kInnerFlags, &flags)) {
-			return false;
-		}
-		*a_out = (flags & 0x1) != 0;
-		return true;
+		return niLight->GetAppCulled();
 	}
 
 	// Leaked on purpose: see LightOrderFix.cpp.
@@ -137,10 +126,9 @@ namespace
 			return original();
 		}
 
-		std::uint32_t count{};
-		void**        array{};
-		const auto*   lb = static_cast<const std::uint8_t*>(a_list);
-		if (!Read(lb + kCount, &count) || !Read(lb + kArray, &array) || !array) {
+		auto* list = static_cast<RE::BSShaderPropertyLightData*>(a_list);
+		const auto count = list->lightList.size();
+		if (count == 0) {
 			return original();
 		}
 
@@ -153,28 +141,25 @@ namespace
 		// derives it that way.  Requiring finite bounds rejects a NaN node
 		// transform, which would make every weight NaN, and catches a list that
 		// was not a node's.
-		float bounds[4]{};
-		if (!Read(lb - g_layout.lightData + kBounds, &bounds)) {
-			return original();
-		}
-		if (!std::ranges::all_of(bounds, [](float f) { return std::isfinite(f); })) {
+		auto* node = reinterpret_cast<RE::BSFadeNode*>(
+			reinterpret_cast<std::uint8_t*>(list) - g_layout.lightData);
+
+		const auto& bounds = node->worldBound;
+		if (!std::isfinite(bounds.center.x) || !std::isfinite(bounds.center.y) ||
+			!std::isfinite(bounds.center.z) || !std::isfinite(bounds.fRadius)) {
 			return original();
 		}
 
 		std::array<Ranked, kMaxRank> ranked{};
 		std::size_t                  n = 0;
 		for (std::uint32_t i = 0; i < count; ++i) {
-			void* light{};
+			auto* light = list->lightList[i];
 			// The original stores nulls and lets them consume a slot; rather than
 			// reproduce that, hand the whole call back.
-			if (!Read(array + i, &light) || !light) {
+			if (!light) {
 				return original();
 			}
-			bool culled{};
-			if (!Culled(light, &culled)) {
-				return original();
-			}
-			if (culled) {
+			if (Culled(light)) {
 				continue;  // skipped without spending a slot, as the original does
 			}
 			float weight{};
