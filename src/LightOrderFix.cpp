@@ -10,6 +10,7 @@
 #include "LightOrderFix.h"
 
 #include "Hook.h"
+#include "RE/BSLight.h"
 
 #include <memory>
 #include <new>
@@ -66,9 +67,6 @@ namespace
 	// stamp, BSTArray) is laid out the same.
 	constexpr std::ptrdiff_t kLightDataFlat = 0x140;
 	constexpr std::ptrdiff_t kLightDataVR = 0x180;
-	constexpr std::ptrdiff_t kArray = 0x10;     // list -> BSLight**
-	constexpr std::ptrdiff_t kCount = 0x20;     // list -> count
-	constexpr std::ptrdiff_t kRefCount = 0x08;  // NiRefObject::refCount
 
 	std::ptrdiff_t g_lightData = kLightDataFlat;  // set in Install
 
@@ -77,11 +75,11 @@ namespace
 
 	struct Pending
 	{
-		const void*                   list{ nullptr };
-		void*                         node{ nullptr };
-		std::array<void*, kMaxLights> lights{};
-		std::uint32_t                 count{ 0 };
-		std::uint32_t                 removed{ 0 };  // bitmask over lights
+		RE::BSShaderPropertyLightData*       list{};
+		RE::BSFadeNode*                      node{};
+		std::array<RE::BSLight*, kMaxLights> lights{};
+		std::uint32_t                        count{ 0 };
+		std::uint32_t                        removed{ 0 };
 	};
 
 	struct PendingSet
@@ -101,48 +99,7 @@ namespace
 	bool (*g_preCullingActive)() = nullptr;
 	void (*g_apply)(void*, void*) = nullptr;
 
-	template <class T>
-	bool Read(const void* a_addr, T* a_out) noexcept
-	{
-		__try {
-			std::memcpy(a_out, a_addr, sizeof(T));
-			return true;
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-			return false;
-		}
-	}
-
-	// A light is unlinked from the node before it is put back, so nothing else
-	// holds it in that window.  NiRefObject-derived: refCount at +0x08, DeleteThis
-	// at vtable slot 1, matching the engine's own `inc lock [rdi+8]` / `xadd lock`
-	// + `call [rax+8]`.
-	void Retain(void* a_object) noexcept
-	{
-		auto* count = reinterpret_cast<volatile LONG*>(
-			static_cast<std::uint8_t*>(a_object) + kRefCount);
-		InterlockedIncrement(count);
-	}
-
-	void Release(void* a_object) noexcept
-	{
-		auto* count = reinterpret_cast<volatile LONG*>(
-			static_cast<std::uint8_t*>(a_object) + kRefCount);
-		if (InterlockedDecrement(count) != 0) {
-			return;
-		}
-		std::uintptr_t vtable{};
-		if (!Read(a_object, &vtable) || !vtable) {
-			return;
-		}
-		std::uintptr_t deleteThis{};
-		if (!Read(reinterpret_cast<const void*>(vtable + 0x08), &deleteThis) ||
-			!deleteThis) {
-			return;
-		}
-		reinterpret_cast<void (*)(void*)>(deleteThis)(a_object);
-	}
-
-	Pending* Find(const void* a_list) noexcept
+	Pending* Find(RE::BSShaderPropertyLightData* a_list) noexcept
 	{
 		auto& pending = *t_pending;
 		for (std::size_t i = 0; i < pending.count; ++i) {
@@ -155,7 +112,7 @@ namespace
 
 	// Snapshots the list as it is before the teardown starts emptying it, which is
 	// the list the rebuild just produced.
-	Pending* Open(const void* a_list) noexcept
+	Pending* Open(RE::BSShaderPropertyLightData* a_list) noexcept
 	{
 		auto& pending = *t_pending;
 		if (pending.count >= kMaxPending) {
@@ -167,13 +124,12 @@ namespace
 			return nullptr;
 		}
 
-		auto* node = static_cast<std::uint8_t*>(const_cast<void*>(a_list)) - g_lightData;
+		auto* node = reinterpret_cast<RE::BSFadeNode*>(
+			reinterpret_cast<std::uint8_t*>(a_list) - g_lightData);
 
-		std::uint32_t count{};
-		void**        array{};
-		if (!Read(static_cast<const std::uint8_t*>(a_list) + kCount, &count) ||
-			!Read(static_cast<const std::uint8_t*>(a_list) + kArray, &array) || !array ||
-			count == 0) {
+		const auto  count = a_list->lightList.size();
+		auto* const array = a_list->lightList.data();
+		if (!array || count == 0) {
 			return nullptr;
 		}
 
@@ -182,8 +138,7 @@ namespace
 		// `cmp dword ptr [node+0x8], 1` and a notification, so nodes can die inside
 		// the walk.  Skipping one already at its last reference leaves that test
 		// unchanged: it compares against 1, and only nodes at 2 or more are held.
-		std::uint32_t refs{};
-		if (!Read(node + kRefCount, &refs) || refs <= 1) {
+		if (node->refCount <= 1) {
 			return nullptr;
 		}
 
@@ -194,13 +149,11 @@ namespace
 
 		const auto take = count < kMaxLights ? count : static_cast<std::uint32_t>(kMaxLights);
 		for (std::uint32_t i = 0; i < take; ++i) {
-			if (!Read(array + i, &p.lights[i])) {
-				return nullptr;
-			}
+			p.lights[i] = a_list->lightList[i];
 		}
 		p.count = take;
 
-		Retain(node);
+		node->IncRefCount();
 		++pending.count;
 		return &p;
 	}
@@ -208,29 +161,27 @@ namespace
 	// The gather copies the first entries, and the engine's add appends once the
 	// list is closed, so an appended put-back would send a different subset to the
 	// shader.  This is a permutation of the same pointers and the same count.
-	void RestoreOrder(const void* a_list, const Pending& a_pending) noexcept
+	void RestoreOrder(RE::BSShaderPropertyLightData* a_list,
+		const Pending& a_pending) noexcept
 	{
-		std::uint32_t count{};
-		void**        array{};
-		if (!Read(static_cast<const std::uint8_t*>(a_list) + kCount, &count) ||
-			!Read(static_cast<const std::uint8_t*>(a_list) + kArray, &array) || !array ||
-			count == 0 || count > kMaxLights) {
+		const auto  count = a_list->lightList.size();
+		auto* const array = a_list->lightList.data();
+		if (!array || count == 0 || count > kMaxLights) {
 			return;
 		}
 
-		std::array<void*, kMaxLights> ordered{};
-		std::size_t                   n = 0;
+		std::array<RE::BSLight*, kMaxLights> ordered{};
+		std::size_t                          n = 0;
 
-		const auto present = [&](void* a_light) {
+		const auto present = [&](RE::BSLight* a_light) {
 			for (std::uint32_t j = 0; j < count; ++j) {
-				void* have{};
-				if (Read(array + j, &have) && have == a_light) {
+				if (array[j] == a_light) {
 					return true;
 				}
 			}
 			return false;
 		};
-		const auto taken = [&](void* a_light) {
+		const auto taken = [&](RE::BSLight* a_light) {
 			for (std::size_t k = 0; k < n; ++k) {
 				if (ordered[k] == a_light) {
 					return true;
@@ -245,8 +196,8 @@ namespace
 			}
 		}
 		for (std::uint32_t j = 0; j < count && n < kMaxLights; ++j) {
-			void* have{};
-			if (!Read(array + j, &have) || !have) {
+			auto* have = array[j];
+			if (!have) {
 				continue;
 			}
 			if (!taken(have)) {
@@ -254,7 +205,7 @@ namespace
 			}
 		}
 		if (n != count) {
-			return;  // not a total permutation; leave it alone
+			return;
 		}
 		__try {
 			for (std::size_t i = 0; i < n; ++i) {
@@ -271,22 +222,25 @@ namespace
 
 	std::uintptr_t Remove(void* a_list, void* a_light)
 	{
+		auto* list = static_cast<RE::BSShaderPropertyLightData*>(a_list);
+		auto* light = static_cast<RE::BSLight*>(a_light);
+
 		// Only removals made by the teardown driver are ours to undo: `remove` is
 		// also reached from the app-culled path, which jumps past the teardown call,
 		// and queuing there would put a culled light back.  And only previs inverts
 		// the order -- with it off the teardown runs first, so a removal there is
 		// discarding last frame's list.
-		if (t_depth != 0 && t_pending && a_list && a_light && g_preCullingActive()) {
-			auto* p = Find(a_list);
+		if (t_depth != 0 && t_pending && list && light && g_preCullingActive()) {
+			auto* p = Find(list);
 			if (!p) {
-				p = Open(a_list);
+				p = Open(list);
 			}
 			if (p) {
 				for (std::uint32_t i = 0; i < p->count; ++i) {
-					if (p->lights[i] == a_light) {
+					if (p->lights[i] == light) {
 						if ((p->removed & (1u << i)) == 0) {
 							p->removed |= 1u << i;
-							Retain(a_light);
+							light->IncRefCount();
 						}
 						break;
 					}
@@ -315,7 +269,7 @@ namespace
 		--t_depth;
 
 		if (t_depth != 0) {
-			return result;  // an outer frame owns the drain
+			return result;
 		}
 
 		// Nothing can add entries here: queuing needs a teardown frame on this
@@ -328,12 +282,12 @@ namespace
 					continue;
 				}
 				g_apply(p.lights[j], p.node);
-				Release(p.lights[j]);
+				p.lights[j]->DecRefCount();
 			}
 			if (p.removed != 0) {
 				RestoreOrder(p.list, p);
 			}
-			Release(p.node);  // taken in Open, unconditionally
+			p.node->DecRefCount();
 		}
 		pending.count = 0;
 		return result;
@@ -356,7 +310,7 @@ namespace LightOrderFix
 		const bool preCullingOk = Hook::Verify(preCullingAddress, kPreCullingPattern,
 			"light order fix (pre-culling query)");
 		if (!applyOk || !preCullingOk) {
-			return false;  // the hooks would call these; do not install them
+			return false;
 		}
 		g_apply = reinterpret_cast<void (*)(void*, void*)>(applyAddress);
 		g_preCullingActive = reinterpret_cast<bool (*)()>(preCullingAddress);
@@ -370,10 +324,6 @@ namespace LightOrderFix
 			reinterpret_cast<void*>(&Teardown), kTeardownPattern,
 			"light order fix (teardown)");
 		if (!remove || !teardown) {
-			// Half the pair is worse than neither: the remove hook only queues under
-			// a teardown frame, so alone it is dead weight in a hot path.  Safe to
-			// drop at load time; nothing is rendering yet, which is why these are
-			// leaked at shutdown instead.
 			g_remove = {};
 			g_teardown = {};
 			return false;
